@@ -1105,26 +1105,45 @@
     document.addEventListener('keydown', function(e){ if(e.key==='Escape') success.classList.remove('show'); });
 
     /* ---------- FILE UPLOAD (Supabase Storage) ---------- */
+    // Work out a real image content-type even when the browser hands us a file
+    // with an empty .type (common for phone screenshots, HEIC, and some drag-drops).
+    // Without this, Supabase stores the file as "application/octet-stream" and its
+    // dashboard preview shows a blank square even though the bytes are fine.
+    function guessMime(file){
+      if(file.type && /^image\//.test(file.type)) return file.type;
+      var ext=(String(file.name).split('.').pop()||'').toLowerCase();
+      var map={ jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif',
+        webp:'image/webp', heic:'image/heic', heif:'image/heif', avif:'image/avif',
+        bmp:'image/bmp', svg:'image/svg+xml', tif:'image/tiff', tiff:'image/tiff', pdf:'application/pdf' };
+      return map[ext] || file.type || 'application/octet-stream';
+    }
     function uploadOne(file){
       var path = Date.now() + '-' + Math.random().toString(36).slice(2,7) + '-' + file.name.replace(/[^\w.\-]+/g,'_');
       var base = SUPABASE_URL.replace(/\/$/,'');
       return fetch(base + '/storage/v1/object/' + SUPABASE_BUCKET + '/' + encodeURIComponent(path), {
         method:'POST',
-        headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY, 'Content-Type':(file.type||'application/octet-stream'), 'x-upsert':'true' },
+        headers:{ 'apikey':SUPABASE_ANON_KEY, 'Authorization':'Bearer '+SUPABASE_ANON_KEY, 'Content-Type':guessMime(file), 'x-upsert':'true' },
         body:file
-      }).then(function(r){ if(!r.ok) throw new Error('upload failed'); return base + '/storage/v1/object/public/' + SUPABASE_BUCKET + '/' + encodeURIComponent(path); });
+      }).then(function(r){
+        if(!r.ok){ return r.text().then(function(t){
+          // Surface the real reason in the console so a misconfigured bucket/policy is never invisible.
+          console.error('[intake] photo upload failed — status '+r.status+':', t);
+          throw new Error('upload failed ('+r.status+')');
+        }); }
+        return base + '/storage/v1/object/public/' + SUPABASE_BUCKET + '/' + encodeURIComponent(path);
+      });
     }
     function collectFiles(){
-      var flat = [], byKey = {}, jobs = [];
+      var flat = [], byKey = {}, jobs = [], fails = 0;
       Object.keys(attachStore).forEach(function(key){
         (attachStore[key]||[]).forEach(function(file){
           if(CONFIGURED){
             jobs.push(uploadOne(file).then(function(url){ (byKey[key]=byKey[key]||[]).push({name:file.name,url:url}); flat.push({field:key,name:file.name,url:url}); })
-              .catch(function(){ (byKey[key]=byKey[key]||[]).push({name:file.name,url:''}); flat.push({field:key,name:file.name,url:''}); }));
+              .catch(function(){ fails++; (byKey[key]=byKey[key]||[]).push({name:file.name,url:''}); flat.push({field:key,name:file.name,url:''}); }));
           } else { (byKey[key]=byKey[key]||[]).push({name:file.name,url:''}); flat.push({field:key,name:file.name,url:''}); }
         });
       });
-      return Promise.all(jobs).then(function(){ return { byKey:byKey, flat:flat }; });
+      return Promise.all(jobs).then(function(){ return { byKey:byKey, flat:flat, fileFails:fails }; });
     }
 
     /* ---------- SEND ---------- */
@@ -1146,7 +1165,12 @@
           body: JSON.stringify(buildPayload(res.byKey, res.flat))
         }).then(function(r){
           sendBtn.textContent=original; sendBtn.disabled=false;
-          if(r.ok){ showSuccess(); } else { copyAll('Could not auto-send, so your answers were copied for you to send'); }
+          if(r.ok){
+            showSuccess();
+            // If the text saved but some photos could not attach, say so plainly
+            // rather than implying everything went through.
+            if(res.fileFails>0){ flash('Your details were sent. '+res.fileFails+' photo'+(res.fileFails>1?'s':'')+' could not attach, so please text or email them to us.'); }
+          } else { copyAll('Could not auto-send, so your answers were copied for you to send'); }
         });
       }).catch(function(){
         sendBtn.textContent=original; sendBtn.disabled=false;
